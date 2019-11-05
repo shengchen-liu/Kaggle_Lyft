@@ -396,28 +396,19 @@ def run_make_train_split():
     numerical_cols = ['object_id', 'center_x', 'center_y', 'center_z', 'width', 'length', 'height', 'yaw']
     train_objects[numerical_cols] = np.float32(train_objects[numerical_cols].values)
 
-    image_file = glob.glob(os.path.join(config.train_data, '*.jpg'))
-    image_file = ['train_images/' + i.split('/')[-1] for i in image_file]
-    print(len(image_file))  # 12568
-    # print(image_file[:10])
+    # Find unique sample_id: 22680
+    sample_id = train_objects['sample_id']. unique().tolist()
+    print('Number of unique sample_id:', len(sample_id))
+    num_unique_sample_id = len(sample_id)
 
-    # without duplicate
-    duplicate = np.array(DUPLICATE).reshape(-1).tolist()  # 88
-    non_duplicate = list(set(image_file) - set(duplicate))  # 12480
-    random.shuffle(non_duplicate)
+    num_valid = 2000
 
-    # 12568
-    num_fold = 2
-    num_valid = 500
+    valid = sample_id[0:num_valid]
+    train = list(set(sample_id) - set(valid))
+    print(set(train).intersection(valid))
 
-    for n in range(num_fold):
-        valid = non_duplicate[n * num_valid:(n + 1) * num_valid]
-        train = list(set(image_file) - set(valid))
-
-        print(set(train).intersection(valid))
-
-        np.save(os.path.join(config.data_dir, 'split/train_a%d_%d.npy' % (n, len(train))), train)
-        np.save(os.path.join(config.data_dir, 'split/valid_a%d_%d.npy' % (n, len(valid))), valid)
+    np.save(os.path.join(config.split, 'train_%d.npy' % (len(train))), train)
+    np.save(os.path.join(config.split, 'valid_%d.npy' % (len(valid))), valid)
 
 
 def run_make_test_split():

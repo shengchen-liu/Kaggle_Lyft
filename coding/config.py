@@ -14,6 +14,8 @@ class DefaultConfigs(object):
         self.test_lidar = os.path.join(self.data_dir, "test_lidar")
         self.test_maps = os.path.join(self.data_dir, "test_maps")
 
+        self.split = os.path.join(PROJECT_PATH, "split")
+
         self.results = os.path.join(PROJECT_PATH, "results")
         self.pretrain_model = os.path.join(self.results, "pretrain_model")
         self.model_name = "Resnet18_supercolumn_FPA_SCse_channel64_lr001_lossweight_batch8" #resnet18-seg-full-softmax-foldb1-1-4balance, resnet34-cls-full-foldb0-0
@@ -43,7 +45,7 @@ class DefaultConfigs(object):
         out_dir = os.path.join(self.results, self.model_name)
         log_dir = os.path.join(self.logs, self.model_name)
         initial_checkpoint = os.path.join(self.results, self.model_name, 'checkpoint')
-        for dirs in [self.results, self.pretrain_model, out_dir, self.back_up, initial_checkpoint, self.logs, log_dir]:
+        for dirs in [self.results, self.split, self.pretrain_model, out_dir, self.back_up, initial_checkpoint, self.logs, log_dir]:
             if not os.path.exists(dirs):
                 os.mkdir(dirs)
 
