@@ -1,11 +1,9 @@
 from common import *
 from config import *
 
-# https://www.kaggle.com/iafoss/severstal-fast-ai-256x256-crops-sub
-# https://www.kaggle.com/rishabhiitbhu/unet-starter-kernel-pytorch-lb-0-88
 
-DEFECT_COLOR = [(0, 0, 0), (0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255)]
-
+object_columns = ['sample_id', 'object_id', 'center_x', 'center_y', 'center_z',
+                  'width', 'length', 'height', 'yaw', 'class_name']
 
 def run_length_decode(rle, height=256, width=1600, fill_value=1):
     mask = np.zeros((height, width), np.float32)
@@ -380,8 +378,24 @@ def run_make_split():
 
 
 def run_make_train_split():
-    # load train.csv as datframe
+    # load train.csv as dataframe
     train_csv = pd.read_csv(os.path.join(config.data_dir, 'train.csv'))
+    objects = []
+    for sample_id, ps in tqdm(train_csv.values[:]):
+        object_params = ps.split()
+        n_objects = len(object_params)
+        for i in range(n_objects // 8):
+            x, y, z, w, l, h, yaw, c = tuple(object_params[i * 8: (i + 1) * 8])
+            objects.append([sample_id, i, x, y, z, w, l, h, yaw, c])
+    train_objects = pd.DataFrame(
+        objects,
+        columns=object_columns
+    )
+
+    # Convert numerical features from str to float32
+    numerical_cols = ['object_id', 'center_x', 'center_y', 'center_z', 'width', 'length', 'height', 'yaw']
+    train_objects[numerical_cols] = np.float32(train_objects[numerical_cols].values)
+
     image_file = glob.glob(os.path.join(config.train_data, '*.jpg'))
     image_file = ['train_images/' + i.split('/')[-1] for i in image_file]
     print(len(image_file))  # 12568
