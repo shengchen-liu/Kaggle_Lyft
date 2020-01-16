@@ -18,7 +18,7 @@ class DefaultConfigs(object):
 
         self.results = os.path.join(PROJECT_PATH, "results")
         self.pretrain_model = os.path.join(self.results, "pretrain_model")
-        self.model_name = "Resnet18_supercolumn_FPA_SCse_channel64_lr001_lossweight_batch8" #resnet18-seg-full-softmax-foldb1-1-4balance, resnet34-cls-full-foldb0-0
+        self.model_name = "unet" #resnet18-seg-full-softmax-foldb1-1-4balance, resnet34-cls-full-foldb0-0
         self.initial_checkpoint = None # 000_model.pth
         self.back_up = os.path.join(self.results, self.model_name, "backup")
         self.debug = 0

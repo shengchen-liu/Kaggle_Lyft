@@ -6,599 +6,47 @@ DATA_DIR = config.data_dir
 
 classes = ["car", "motorcycle", "bus", "bicycle", "truck", "pedestrian", "other_vehicle", "animal", "emergency_vehicle"]
 
+# Our code will generate data, visualization and model checkpoints, they will be persisted to disk in this folder
+ARTIFACTS_FOLDER = "../artifacts"
+os.makedirs(ARTIFACTS_FOLDER, exist_ok=True)
 
-class LyftDataset:
-    """Database class for Lyft Dataset to help query and retrieve information from the database."""
 
-    def __init__(self, data_path: str, json_path: str, verbose: bool = True, map_resolution: float = 0.1, mode = 'train'):
-        """Loads database and creates reverse indexes and shortcuts.
+class BEVImageDataset(Dataset):
+    def __init__(self, mode, input_filepaths, target_filepaths, map_filepaths=None):
+        self.input_filepaths = input_filepaths
+        self.target_filepaths = target_filepaths
+        self.map_filepaths = map_filepaths
 
-        Args:
-            data_path: Path to the tables and data.
-            json_path: Path to the folder with json files
-            verbose: Whether to print status messages during load.
-            map_resolution: Resolution of maps (meters).
-        """
-        self.mode = mode
-        self.data_path = Path(data_path).expanduser().absolute()
-        self.json_path = Path(json_path)
+        if map_filepaths is not None:
+            assert len(input_filepaths) == len(map_filepaths)
 
-        self.table_names = [
-            "category",
-            "attribute",
-            "visibility",
-            "instance",
-            "sensor",
-            "calibrated_sensor",
-            "ego_pose",
-            "log",
-            "scene",
-            "sample",
-            "sample_data",
-            "sample_annotation",
-            "map",
-        ]
+        assert len(input_filepaths) == len(target_filepaths)
 
-        start_time = time.time()
+    def __len__(self):
+        return len(self.input_filepaths)
 
-        # Explicitly assign tables to help the IDE determine valid class members.
-        self.category = self.__load_table__("category", verbose)
-        self.attribute = self.__load_table__("attribute", verbose)
-        self.visibility = self.__load_table__("visibility", verbose)
-        self.instance = self.__load_table__("instance", verbose, missing_ok=True)
-        self.sensor = self.__load_table__("sensor", verbose)
-        self.calibrated_sensor = self.__load_table__("calibrated_sensor", verbose)
-        self.ego_pose = self.__load_table__("ego_pose", verbose)
-        self.log = self.__load_table__("log", verbose)
-        self.scene = self.__load_table__("scene", verbose)
-        self.sample = self.__load_table__("sample", verbose)
-        self.sample_data = self.__load_table__("sample_data", verbose)
-        self.sample_annotation = self.__load_table__("sample_annotation", verbose, missing_ok=True)
-        self.map = self.__load_table__("map", verbose)
+    def __getitem__(self, idx):
+        input_filepath = self.input_filepaths[idx]
+        target_filepath = self.target_filepaths[idx]
 
-        # Initialize map mask for each map record.
-        for map_record in self.map:
-            map_record["mask"] = MapMask(self.data_path / '{0}_{1}'.format(self.mode, map_record["filename"]), resolution=map_resolution)
+        sample_token = input_filepath.split("/")[-1].replace("_input.png", "")
 
-        if verbose:
-            for table in self.table_names:
-                print("{} {},".format(len(getattr(self, table)), table))
-            print("Done loading in {:.1f} seconds.\n======".format(time.time() - start_time))
+        im = cv2.imread(input_filepath, cv2.IMREAD_UNCHANGED)
 
-        # Make reverse indexes for common lookups.
-        self.__make_reverse_index__(verbose)
+        if self.map_filepaths:
+            map_filepath = self.map_filepaths[idx]
+            map_im = cv2.imread(map_filepath, cv2.IMREAD_UNCHANGED)
+            im = np.concatenate((im, map_im), axis=2)
 
-        # Initialize LyftDatasetExplorer class
-        self.explorer = LyftDatasetExplorer(self)
+        target = cv2.imread(target_filepath, cv2.IMREAD_UNCHANGED)
 
-    def __load_table__(self, table_name, verbose=False, missing_ok=False) -> dict:
-        """Loads a table."""
-        filepath = str(self.json_path.joinpath("{}.json".format(table_name)))
+        im = im.astype(np.float32) / 255
+        target = target.astype(np.int64) # [H, W]
 
-        if not os.path.isfile(filepath) and missing_ok:
-            if verbose:
-                print("JSON file {}.json missing, using empty list".format(table_name))
-            return []
+        im = torch.from_numpy(im.transpose(2, 0, 1))
+        target = torch.from_numpy(target)
 
-        with open(filepath) as f:
-            table = json.load(f)
-        return table
-
-    def __make_reverse_index__(self, verbose: bool) -> None:
-        """De-normalizes database to create reverse indices for common cases.
-
-        Args:
-            verbose: Whether to print outputs.
-
-        """
-
-        start_time = time.time()
-        if verbose:
-            print("Reverse indexing ...")
-
-        # Store the mapping from token to table index for each table.
-        self._token2ind = dict()
-        for table in self.table_names:
-            self._token2ind[table] = dict()
-
-            for ind, member in enumerate(getattr(self, table)):
-                self._token2ind[table][member["token"]] = ind
-
-        # Decorate (adds short-cut) sample_annotation table with for category name.
-        for record in self.sample_annotation:
-            inst = self.get("instance", record["instance_token"])
-            record["category_name"] = self.get("category", inst["category_token"])["name"]
-
-        # Decorate (adds short-cut) sample_data with sensor information.
-        for record in self.sample_data:
-            cs_record = self.get("calibrated_sensor", record["calibrated_sensor_token"])
-            sensor_record = self.get("sensor", cs_record["sensor_token"])
-            record["sensor_modality"] = sensor_record["modality"]
-            record["channel"] = sensor_record["channel"]
-
-        # Reverse-index samples with sample_data and annotations.
-        for record in self.sample:
-            record["data"] = {}
-            record["anns"] = []
-
-        for record in self.sample_data:
-            if record["is_key_frame"]:
-                sample_record = self.get("sample", record["sample_token"])
-                sample_record["data"][record["channel"]] = record["token"]
-
-        for ann_record in self.sample_annotation:
-            sample_record = self.get("sample", ann_record["sample_token"])
-            sample_record["anns"].append(ann_record["token"])
-
-        # Add reverse indices from log records to map records.
-        if "log_tokens" not in self.map[0].keys():
-            raise Exception("Error: log_tokens not in map table. This code is not compatible with the teaser dataset.")
-        log_to_map = dict()
-        for map_record in self.map:
-            for log_token in map_record["log_tokens"]:
-                log_to_map[log_token] = map_record["token"]
-        for log_record in self.log:
-            log_record["map_token"] = log_to_map[log_record["token"]]
-
-        if verbose:
-            print("Done reverse indexing in {:.1f} seconds.\n======".format(time.time() - start_time))
-
-    def get(self, table_name: str, token: str) -> dict:
-        """Returns a record from table in constant runtime.
-
-        Args:
-            table_name: Table name.
-            token: Token of the record.
-
-        Returns: Table record.
-
-        """
-
-        assert table_name in self.table_names, "Table {} not found".format(table_name)
-
-        return getattr(self, table_name)[self.getind(table_name, token)]
-
-    def getind(self, table_name: str, token: str) -> int:
-        """Returns the index of the record in a table in constant runtime.
-
-        Args:
-            table_name: Table name.
-            token: The index of the record in table, table is an array.
-
-        Returns:
-
-        """
-        return self._token2ind[table_name][token]
-
-    def field2token(self, table_name: str, field: str, query) -> List[str]:
-        """Query all records for a certain field value, and returns the tokens for the matching records.
-
-        Runs in linear time.
-
-        Args:
-            table_name: Table name.
-            field: Field name.
-            query: Query to match against. Needs to type match the content of the query field.
-
-        Returns: List of tokens for the matching records.
-
-        """
-        matches = []
-        for member in getattr(self, table_name):
-            if member[field] == query:
-                matches.append(member["token"])
-        return matches
-
-    def get_sample_data_path(self, sample_data_token: str) -> Path:
-        """Returns the path to a sample_data.
-
-        Args:
-            sample_data_token:
-
-        Returns:
-
-        """
-
-        sd_record = self.get("sample_data", sample_data_token)
-        return self.data_path / sd_record["filename"]
-
-    def get_sample_data(
-            self,
-            sample_data_token: str,
-            box_vis_level: BoxVisibility = BoxVisibility.ANY,
-            selected_anntokens: List[str] = None,
-            flat_vehicle_coordinates: bool = False,
-    ) -> Tuple[Path, List[Box], np.array]:
-        """Returns the data path as well as all annotations related to that sample_data.
-        The boxes are transformed into the current sensor's coordinate frame.
-
-        Args:
-            sample_data_token: Sample_data token.
-            box_vis_level: If sample_data is an image, this sets required visibility for boxes.
-            selected_anntokens: If provided only return the selected annotation.
-            flat_vehicle_coordinates: Instead of current sensor's coordinate frame, use vehicle frame which is
-        aligned to z-plane in world
-
-        Returns: (data_path, boxes, camera_intrinsic <np.array: 3, 3>)
-
-        """
-
-        # Retrieve sensor & pose records
-        sd_record = self.get("sample_data", sample_data_token)
-        cs_record = self.get("calibrated_sensor", sd_record["calibrated_sensor_token"])
-        sensor_record = self.get("sensor", cs_record["sensor_token"])
-        pose_record = self.get("ego_pose", sd_record["ego_pose_token"])
-
-        data_path = self.get_sample_data_path(sample_data_token)
-
-        if sensor_record["modality"] == "camera":
-            cam_intrinsic = np.array(cs_record["camera_intrinsic"])
-            imsize = (sd_record["width"], sd_record["height"])
-        else:
-            cam_intrinsic = None
-            imsize = None
-
-        # Retrieve all sample annotations and map to sensor coordinate system.
-        if selected_anntokens is not None:
-            boxes = list(map(self.get_box, selected_anntokens))
-        else:
-            boxes = self.get_boxes(sample_data_token)
-
-        # Make list of Box objects including coord system transforms.
-        box_list = []
-        for box in boxes:
-            if flat_vehicle_coordinates:
-                # Move box to ego vehicle coord system parallel to world z plane
-                ypr = Quaternion(pose_record["rotation"]).yaw_pitch_roll
-                yaw = ypr[0]
-
-                box.translate(-np.array(pose_record["translation"]))
-                box.rotate(Quaternion(scalar=np.cos(yaw / 2), vector=[0, 0, np.sin(yaw / 2)]).inverse)
-
-            else:
-                # Move box to ego vehicle coord system
-                box.translate(-np.array(pose_record["translation"]))
-                box.rotate(Quaternion(pose_record["rotation"]).inverse)
-
-                #  Move box to sensor coord system
-                box.translate(-np.array(cs_record["translation"]))
-                box.rotate(Quaternion(cs_record["rotation"]).inverse)
-
-            if sensor_record["modality"] == "camera" and not box_in_image(
-                    box, cam_intrinsic, imsize, vis_level=box_vis_level
-            ):
-                continue
-
-            box_list.append(box)
-
-        return data_path, box_list, cam_intrinsic
-
-    def get_box(self, sample_annotation_token: str) -> Box:
-        """Instantiates a Box class from a sample annotation record.
-
-        Args:
-            sample_annotation_token: Unique sample_annotation identifier.
-
-        Returns:
-
-        """
-        record = self.get("sample_annotation", sample_annotation_token)
-        return Box(
-            record["translation"],
-            record["size"],
-            Quaternion(record["rotation"]),
-            name=record["category_name"],
-            token=record["token"],
-        )
-
-    def get_boxes(self, sample_data_token: str) -> List[Box]:
-        """Instantiates Boxes for all annotation for a particular sample_data record. If the sample_data is a
-        keyframe, this returns the annotations for that sample. But if the sample_data is an intermediate
-        sample_data, a linear interpolation is applied to estimate the location of the boxes at the time the
-        sample_data was captured.
-
-
-
-        Args:
-            sample_data_token: Unique sample_data identifier.
-
-        Returns:
-
-        """
-
-        # Retrieve sensor & pose records
-        sd_record = self.get("sample_data", sample_data_token)
-        curr_sample_record = self.get("sample", sd_record["sample_token"])
-
-        if curr_sample_record["prev"] == "" or sd_record["is_key_frame"]:
-            # If no previous annotations available, or if sample_data is keyframe just return the current ones.
-            boxes = list(map(self.get_box, curr_sample_record["anns"]))
-
-        else:
-            prev_sample_record = self.get("sample", curr_sample_record["prev"])
-
-            curr_ann_recs = [self.get("sample_annotation", token) for token in curr_sample_record["anns"]]
-            prev_ann_recs = [self.get("sample_annotation", token) for token in prev_sample_record["anns"]]
-
-            # Maps instance tokens to prev_ann records
-            prev_inst_map = {entry["instance_token"]: entry for entry in prev_ann_recs}
-
-            t0 = prev_sample_record["timestamp"]
-            t1 = curr_sample_record["timestamp"]
-            t = sd_record["timestamp"]
-
-            # There are rare situations where the timestamps in the DB are off so ensure that t0 < t < t1.
-            t = max(t0, min(t1, t))
-
-            boxes = []
-            for curr_ann_rec in curr_ann_recs:
-
-                if curr_ann_rec["instance_token"] in prev_inst_map:
-                    # If the annotated instance existed in the previous frame, interpolate center & orientation.
-                    prev_ann_rec = prev_inst_map[curr_ann_rec["instance_token"]]
-
-                    # Interpolate center.
-                    center = [
-                        np.interp(t, [t0, t1], [c0, c1])
-                        for c0, c1 in zip(prev_ann_rec["translation"], curr_ann_rec["translation"])
-                    ]
-
-                    # Interpolate orientation.
-                    rotation = Quaternion.slerp(
-                        q0=Quaternion(prev_ann_rec["rotation"]),
-                        q1=Quaternion(curr_ann_rec["rotation"]),
-                        amount=(t - t0) / (t1 - t0),
-                    )
-
-                    box = Box(
-                        center,
-                        curr_ann_rec["size"],
-                        rotation,
-                        name=curr_ann_rec["category_name"],
-                        token=curr_ann_rec["token"],
-                    )
-                else:
-                    # If not, simply grab the current annotation.
-                    box = self.get_box(curr_ann_rec["token"])
-
-                boxes.append(box)
-        return boxes
-
-    def box_velocity(self, sample_annotation_token: str, max_time_diff: float = 1.5) -> np.ndarray:
-        """Estimate the velocity for an annotation.
-
-        If possible, we compute the centered difference between the previous and next frame.
-        Otherwise we use the difference between the current and previous/next frame.
-        If the velocity cannot be estimated, values are set to np.nan.
-
-        Args:
-            sample_annotation_token: Unique sample_annotation identifier.
-            max_time_diff: Max allowed time diff between consecutive samples that are used to estimate velocities.
-
-
-        Returns: <np.float: 3>. Velocity in x/y/z direction in m/s.
-
-        """
-
-        current = self.get("sample_annotation", sample_annotation_token)
-        has_prev = current["prev"] != ""
-        has_next = current["next"] != ""
-
-        # Cannot estimate velocity for a single annotation.
-        if not has_prev and not has_next:
-            return np.array([np.nan, np.nan, np.nan])
-
-        if has_prev:
-            first = self.get("sample_annotation", current["prev"])
-        else:
-            first = current
-
-        if has_next:
-            last = self.get("sample_annotation", current["next"])
-        else:
-            last = current
-
-        pos_last = np.array(last["translation"])
-        pos_first = np.array(first["translation"])
-        pos_diff = pos_last - pos_first
-
-        time_last = 1e-6 * self.get("sample", last["sample_token"])["timestamp"]
-        time_first = 1e-6 * self.get("sample", first["sample_token"])["timestamp"]
-        time_diff = time_last - time_first
-
-        if has_next and has_prev:
-            # If doing centered difference, allow for up to double the max_time_diff.
-            max_time_diff *= 2
-
-        if time_diff > max_time_diff:
-            # If time_diff is too big, don't return an estimate.
-            return np.array([np.nan, np.nan, np.nan])
-        else:
-            return pos_diff / time_diff
-
-    def list_categories(self) -> None:
-        self.explorer.list_categories()
-
-    def list_attributes(self) -> None:
-        self.explorer.list_attributes()
-
-    def list_scenes(self) -> None:
-        self.explorer.list_scenes()
-
-    def list_sample(self, sample_token: str) -> None:
-        self.explorer.list_sample(sample_token)
-
-    def render_pointcloud_in_image(
-            self,
-            sample_token: str,
-            dot_size: int = 5,
-            pointsensor_channel: str = "LIDAR_TOP",
-            camera_channel: str = "CAM_FRONT",
-            out_path: str = None,
-    ) -> None:
-        self.explorer.render_pointcloud_in_image(
-            sample_token,
-            dot_size,
-            pointsensor_channel=pointsensor_channel,
-            camera_channel=camera_channel,
-            out_path=out_path,
-        )
-
-    def render_sample(
-            self,
-            sample_token: str,
-            box_vis_level: BoxVisibility = BoxVisibility.ANY,
-            nsweeps: int = 1,
-            out_path: str = None,
-    ) -> None:
-        self.explorer.render_sample(sample_token, box_vis_level, nsweeps=nsweeps, out_path=out_path)
-
-    def render_sample_data(
-            self,
-            sample_data_token: str,
-            with_anns: bool = True,
-            box_vis_level: BoxVisibility = BoxVisibility.ANY,
-            axes_limit: float = 40,
-            ax: Axes = None,
-            nsweeps: int = 1,
-            out_path: str = None,
-            underlay_map: bool = False,
-    ) -> None:
-        return self.explorer.render_sample_data(
-            sample_data_token,
-            with_anns,
-            box_vis_level,
-            axes_limit,
-            ax,
-            num_sweeps=nsweeps,
-            out_path=out_path,
-            underlay_map=underlay_map,
-        )
-
-    def render_annotation(
-            self,
-            sample_annotation_token: str,
-            margin: float = 10,
-            view: np.ndarray = np.eye(4),
-            box_vis_level: BoxVisibility = BoxVisibility.ANY,
-            out_path: str = None,
-    ) -> None:
-        self.explorer.render_annotation(sample_annotation_token, margin, view, box_vis_level, out_path)
-
-    def render_instance(self, instance_token: str, out_path: str = None) -> None:
-        self.explorer.render_instance(instance_token, out_path=out_path)
-
-    def render_scene(self, scene_token: str, freq: float = 10, imwidth: int = 640, out_path: str = None) -> None:
-        self.explorer.render_scene(scene_token, freq, image_width=imwidth, out_path=out_path)
-
-    def render_scene_channel(
-            self,
-            scene_token: str,
-            channel: str = "CAM_FRONT",
-            freq: float = 10,
-            imsize: Tuple[float, float] = (640, 360),
-            out_path: Path = None,
-            interactive: bool = True,
-            verbose: bool = False,
-    ) -> None:
-        self.explorer.render_scene_channel(
-            scene_token=scene_token,
-            channel=channel,
-            freq=freq,
-            image_size=imsize,
-            out_path=out_path,
-            interactive=interactive,
-            verbose=verbose,
-        )
-
-    def render_egoposes_on_map(self, log_location: str, scene_tokens: List = None, out_path: str = None) -> None:
-        self.explorer.render_egoposes_on_map(log_location, scene_tokens, out_path=out_path)
-
-    def render_sample_3d_interactive(
-            self,
-            sample_id: str,
-            render_sample: bool = True
-    ) -> None:
-        """Render 3D visualization of the sample using plotly
-
-        Args:
-            sample_id: Unique sample identifier.
-            render_sample: call self.render_sample (Render all LIDAR and camera sample_data in sample along with annotations.)
-
-        """
-        import pandas as pd
-        import plotly.graph_objects as go
-
-        sample = self.get('sample', sample_id)
-        sample_data = self.get(
-            'sample_data',
-            sample['data']['LIDAR_TOP']
-        )
-        pc = LidarPointCloud.from_file(
-            Path(os.path.join(str(self.data_path),
-                              sample_data['filename']))
-        )
-        _, boxes, _ = self.get_sample_data(
-            sample['data']['LIDAR_TOP'], flat_vehicle_coordinates=False
-        )
-
-        if render_sample:
-            self.render_sample(sample_id)
-
-        df_tmp = pd.DataFrame(pc.points[:3, :].T, columns=['x', 'y', 'z'])
-        df_tmp['norm'] = np.sqrt(np.power(df_tmp[['x', 'y', 'z']].values, 2).sum(axis=1))
-        scatter = go.Scatter3d(
-            x=df_tmp['x'],
-            y=df_tmp['y'],
-            z=df_tmp['z'],
-            mode='markers',
-            marker=dict(
-                size=1,
-                color=df_tmp['norm'],
-                opacity=0.8
-            )
-        )
-
-        x_lines = []
-        y_lines = []
-        z_lines = []
-
-        def f_lines_add_nones():
-            x_lines.append(None)
-            y_lines.append(None)
-            z_lines.append(None)
-
-        ixs_box_0 = [0, 1, 2, 3, 0]
-        ixs_box_1 = [4, 5, 6, 7, 4]
-
-        for box in boxes:
-            points = view_points(box.corners(), view=np.eye(3), normalize=False)
-            x_lines.extend(points[0, ixs_box_0])
-            y_lines.extend(points[1, ixs_box_0])
-            z_lines.extend(points[2, ixs_box_0])
-            f_lines_add_nones()
-            x_lines.extend(points[0, ixs_box_1])
-            y_lines.extend(points[1, ixs_box_1])
-            z_lines.extend(points[2, ixs_box_1])
-            f_lines_add_nones()
-            for i in range(4):
-                x_lines.extend(points[0, [ixs_box_0[i], ixs_box_1[i]]])
-                y_lines.extend(points[1, [ixs_box_0[i], ixs_box_1[i]]])
-                z_lines.extend(points[2, [ixs_box_0[i], ixs_box_1[i]]])
-                f_lines_add_nones()
-
-        lines = go.Scatter3d(
-            x=x_lines,
-            y=y_lines,
-            z=z_lines,
-            mode='lines',
-            name='lines'
-        )
-
-        fig = go.Figure(data=[scatter, lines])
-        fig.update_layout(scene_aspectmode='data')
-        fig.show()
-
+        return im, target, sample_token
 
 class SteelDataset(Dataset):
     def __init__(self, split, csv, mode, augment=None):
@@ -1077,13 +525,144 @@ def create_voxel_pointcloud(points, shape, voxel_size=(0.5, 0.5, 1), z_offset=0)
 def normalize_voxel_intensities(bev, max_intensity=16):
     return (bev / max_intensity).clip(0, 1)
 
+
+def move_boxes_to_car_space(boxes, ego_pose):
+    """
+    Move boxes from world space to car space.
+    Note: mutates input boxes.
+    """
+    translation = -np.array(ego_pose['translation'])
+    rotation = Quaternion(ego_pose['rotation']).inverse
+
+    for box in boxes:
+        # Bring box to car space
+        box.translate(translation)
+        box.rotate(rotation)
+
+
+def scale_boxes(boxes, factor):
+    """
+    Note: mutates input boxes
+    """
+    for box in boxes:
+        box.wlh = box.wlh * factor
+
+
+def draw_boxes(im, voxel_size, boxes, classes, z_offset=0.0):
+    for box in boxes:
+        # We only care about the bottom corners
+        corners = box.bottom_corners()
+        corners_voxel = car_to_voxel_coords(corners, im.shape, voxel_size, z_offset).transpose(1, 0)
+        corners_voxel = corners_voxel[:, :2]  # Drop z coord
+
+        class_color = classes.index(box.name) + 1
+
+        if class_color == 0:
+            raise Exception("Unknown class: {}".format(box.name))
+
+        cv2.drawContours(im, np.int0([corners_voxel]), 0, (class_color, class_color, class_color), -1)
+
+def get_semantic_map_around_ego(map_mask, ego_pose, voxel_size, output_shape):
+
+    def crop_image(image: np.array,
+                           x_px: int,
+                           y_px: int,
+                           axes_limit_px: int) -> np.array:
+                x_min = int(x_px - axes_limit_px)
+                x_max = int(x_px + axes_limit_px)
+                y_min = int(y_px - axes_limit_px)
+                y_max = int(y_px + axes_limit_px)
+
+                # cropped_image = image[0]
+                cropped_image = image[y_min:y_max, x_min:x_max]
+
+                return cropped_image
+
+    pixel_coords = map_mask.to_pixel_coords(ego_pose['translation'][0], ego_pose['translation'][1])
+
+    extent = voxel_size * output_shape[0] * 0.5
+    scaled_limit_px = int(extent * (1.0 / (map_mask.resolution)))
+    mask_raster = map_mask.mask()
+
+    cropped = crop_image(mask_raster, pixel_coords[0], pixel_coords[1], int(scaled_limit_px * np.sqrt(2)))
+
+    ypr_rad = Quaternion(ego_pose['rotation']).yaw_pitch_roll
+    yaw_deg = -np.degrees(ypr_rad[0])
+
+    rotated_cropped = np.array(Image.fromarray(cropped).rotate(yaw_deg))
+    ego_centric_map = crop_image(rotated_cropped, rotated_cropped.shape[1] / 2, rotated_cropped.shape[0] / 2,
+                                 scaled_limit_px)[::-1]
+
+    ego_centric_map = cv2.resize(ego_centric_map, output_shape[:2], cv2.INTER_NEAREST)
+    return ego_centric_map.astype(np.float32) / 255
+
+
+def visualize_lidar_of_sample(dataset, sample_token, axes_limit=80):
+    sample = dataset.get("sample", sample_token)
+    sample_lidar_token = sample["data"]["LIDAR_TOP"]
+    dataset.render_sample_data(sample_lidar_token, axes_limit=axes_limit)
+
 ##############################################################
 
-def run_check_train_dataset():
-    dataset = LyftDataset(data_path=config.data_dir, json_path=config.train_data)
+def prepare_training_data_for_scene(first_sample_token, dataset, output_folder, bev_shape, voxel_size, z_offset, box_scale, map_mask):
+    """
+    Given a first sample token (in a scene), output rasterized input volumes and targets in birds-eye-view perspective.
+
+    """
+    sample_token = first_sample_token
+
+    while sample_token:
+
+        sample = dataset.get("sample", sample_token)
+
+        sample_lidar_token = sample["data"]["LIDAR_TOP"]
+        lidar_data = dataset.get("sample_data", sample_lidar_token)
+        lidar_filepath = dataset.get_sample_data_path(sample_lidar_token)
+
+        ego_pose = dataset.get("ego_pose", lidar_data["ego_pose_token"])
+        calibrated_sensor = dataset.get("calibrated_sensor", lidar_data["calibrated_sensor_token"])
+
+        # global_from_car = transform_matrix(ego_pose['translation'],
+        #                                    Quaternion(ego_pose['rotation']), inverse=False)
+
+        car_from_sensor = transform_matrix(calibrated_sensor['translation'], Quaternion(calibrated_sensor['rotation']),
+                                           inverse=False)
+
+        try:
+            lidar_pointcloud = LidarPointCloud.from_file(lidar_filepath)
+            lidar_pointcloud.transform(car_from_sensor)
+        except Exception as e:
+            print("Failed to load Lidar Pointcloud for {}: {}:".format(sample_token, e))
+            sample_token = sample["next"]
+            continue
+
+        bev = create_voxel_pointcloud(lidar_pointcloud.points, bev_shape, voxel_size=voxel_size, z_offset=z_offset)
+        bev = normalize_voxel_intensities(bev)
+
+        boxes = dataset.get_boxes(sample_lidar_token)
+
+        target = np.zeros_like(bev)
+
+        # move_boxes_to_car_space(boxes, ego_pose)
+        # scale_boxes(boxes, box_scale)
+        # draw_boxes(target, voxel_size, boxes=boxes, classes=classes, z_offset=z_offset)
+
+        # bev_im = np.round(bev * 255).astype(np.uint8)
+        target_im = target[:, :, 0]  # take one channel only
+
+        semantic_im = get_semantic_map_around_ego(map_mask, ego_pose, voxel_size[0], target_im.shape)
+        semantic_im = np.round(semantic_im * 255).astype(np.uint8)
+
+        # cv2.imwrite(os.path.join(output_folder, "{}_input.png".format(sample_token)), bev_im)
+        # cv2.imwrite(os.path.join(output_folder, "{}_target.png".format(sample_token)), target_im)
+        cv2.imwrite(os.path.join(output_folder, "{}_map.png".format(sample_token)), semantic_im)
+
+        sample_token = sample["next"]
+
+def generate_bev_data():
+    dataset = LyftDataset(data_path=config.data_dir, json_path=config.train_data) # config.test_data
     records = [(dataset.get('sample', record['first_sample_token'])['timestamp'], record) for record in
                dataset.scene]
-
     entries = []
 
     for start_time, record in sorted(records):
@@ -1099,78 +678,157 @@ def run_check_train_dataset():
 
     df = pd.DataFrame(entries, columns=["host", "scene_name", "date", "scene_token", "first_sample_token"])
 
+    entries = None
     host_count_df = df.groupby("host")['scene_token'].count()
     print(host_count_df)
 
     # Let's split the data by car to get a validation set.
-    validation_hosts = ["host-a007", "host-a008"]
-
+    validation_hosts = ["host-a007", "host-a008", "host-a009"]
+    #
     validation_df = df[df["host"].isin(validation_hosts)]
     vi = validation_df.index
     train_df = df[~df.index.isin(vi)]
-
+    df = None
+    vi = None
     print(len(train_df), len(validation_df), "train/validation split scene counts")
 
-    sample_token = train_df.first_sample_token.values[0]
+    sample_token = train_df.first_sample_token.values[0] # 'cea0bba4b425537cca52b17bf81569a20da1ca6d359f33227f0230d59d9d2881'
+    # sample_token = 'cea0bba4b425537cca52b17bf81569a20da1ca6d359f33227f0230d59d9d2881'
     sample = dataset.get("sample", sample_token)
 
     sample_lidar_token = sample["data"]["LIDAR_TOP"]
     lidar_data = dataset.get("sample_data", sample_lidar_token)
-    lidar_filepath = dataset.get_sample_data_path(sample_lidar_token)
+    # lidar_filepath = dataset.get_sample_data_path(sample_lidar_token)
 
     ego_pose = dataset.get("ego_pose", lidar_data["ego_pose_token"])
-    calibrated_sensor = dataset.get("calibrated_sensor", lidar_data["calibrated_sensor_token"])
+    # calibrated_sensor = dataset.get("calibrated_sensor", lidar_data["calibrated_sensor_token"])
 
     # Homogeneous transformation matrix from car frame to world frame.
-    global_from_car = transform_matrix(ego_pose['translation'],
-                                       Quaternion(ego_pose['rotation']), inverse=False)
+    # global_from_car = transform_matrix(ego_pose['translation'],
+    #                                    Quaternion(ego_pose['rotation']), inverse=False)
 
     # Homogeneous transformation matrix from sensor coordinate frame to ego car frame.
-    car_from_sensor = transform_matrix(calibrated_sensor['translation'], Quaternion(calibrated_sensor['rotation']),
-                                       inverse=False)
+    # car_from_sensor = transform_matrix(calibrated_sensor['translation'], Quaternion(calibrated_sensor['rotation']),
+    #                                    inverse=False)
 
-    lidar_pointcloud = LidarPointCloud.from_file(lidar_filepath)
+    # lidar_pointcloud = LidarPointCloud.from_file(lidar_filepath)
+    #
+    # # The lidar pointcloud is defined in the sensor's reference frame.
+    # # We want it in the car's reference frame, so we transform each point
+    # lidar_pointcloud.transform(car_from_sensor)
 
-    # The lidar pointcloud is defined in the sensor's reference frame.
-    # We want it in the car's reference frame, so we transform each point
-    lidar_pointcloud.transform(car_from_sensor)
+    # A sanity check, the points should be centered around 0 in car space.
+    # plt.hist(lidar_pointcloud.points[0], alpha=0.5, bins=30, label="X")
+    # plt.hist(lidar_pointcloud.points[1], alpha=0.5, bins=30, label="Y")
+    # plt.legend()
+    # plt.xlabel("Distance from car along axis")
+    # plt.ylabel("Amount of points")
+    # plt.show()
+
+    map_mask = dataset.map[0]["mask"]
+    sample = None
+    lidar_data = None
+
+    # ego_centric_map = get_semantic_map_around_ego(map_mask, ego_pose, voxel_size=0.4, output_shape=(336, 336))
+    # plt.imshow(ego_centric_map)
+    # plt.show()
+
 
     voxel_size = (0.4, 0.4, 1.5)
     z_offset = -2.0
     bev_shape = (336, 336, 3)
 
-    bev = create_voxel_pointcloud(lidar_pointcloud.points, bev_shape, voxel_size=voxel_size, z_offset=z_offset)
+    # bev = create_voxel_pointcloud(lidar_pointcloud.points, bev_shape, voxel_size=voxel_size, z_offset=z_offset)
 
     # So that the values in the voxels range from 0,1 we set a maximum intensity.
-    bev = normalize_voxel_intensities(bev)
+    # bev = normalize_voxel_intensities(bev)
 
-    plt.figure(figsize=(16, 8))
-    plt.imshow(bev)
-    plt.show()
+    # plt.figure(figsize=(16, 8))
+    # plt.imshow(bev)
+    # plt.show()
 
-    # the dataset consists of several scences, which are 25-45 second clips of image of LiDAR data from a self-driving car.
+    # Boxes
+    # boxes = dataset.get_boxes(sample_lidar_token)
+    # '79cfdc04cfdfb870c338df801e5bfc5dcf0f6cd325a5229aedda4031b8b198bc'
+    # target_im = np.zeros(bev.shape[:3], dtype=np.uint8)
 
-    dataset = SteelDataset(
-        mode='train',
-        csv=['train.csv', ],
-        split=['train0_12068.npy', ],
-        augment=None,  #
-    )
-    print(dataset)
-    # exit(0)
+    # move_boxes_to_car_space(boxes, ego_pose)
+    # scale_boxes(boxes, 0.8)
+    # draw_boxes(target_im, voxel_size, boxes, classes, z_offset=z_offset)
 
-    for n in range(0, len(dataset)):
+    # plt.figure(figsize=(8, 8))
+    # plt.imshow((target_im > 0).astype(np.float32), cmap='Set2')
+    # plt.show()
+
+    # We scale down each box so they are more separated when projected into our coarse voxel space.
+    box_scale = 0.8
+
+    # "bev" stands for birds eye view
+
+    train_data_folder = os.path.join(ARTIFACTS_FOLDER, "bev_train_data")
+    validation_data_folder = os.path.join(ARTIFACTS_FOLDER, "./bev_validation_data")
+    NUM_WORKERS = os.cpu_count() * 1
+
+    for df, data_folder in [(train_df, train_data_folder), (validation_df, validation_data_folder)]:
+        print("Preparing data into {} using {} workers".format(data_folder, NUM_WORKERS))
+        first_samples = df.first_sample_token.values
+
+        os.makedirs(data_folder, exist_ok=True)
+        for first_sample in tqdm(first_samples):
+
+            prepare_training_data_for_scene(first_sample_token=first_sample, dataset=dataset, output_folder=data_folder,
+                                            bev_shape=bev_shape, voxel_size=voxel_size, z_offset=z_offset, box_scale=box_scale,
+                                            map_mask=map_mask)
+        # process_func = partial(prepare_training_data_for_scene,
+        #                        dataset=dataset, output_folder=data_folder, bev_shape=bev_shape, voxel_size=voxel_size, z_offset=z_offset,
+        #                        box_scale=box_scale, map_mask=map_mask)
+        #
+        # pool = Pool(1)
+        # for _ in tqdm(pool.imap_unordered(process_func, first_samples), total=len(first_samples)):
+        #     pass
+        # pool.close()
+        # del pool
+
+    # Failed to load Lidar Pointcloud for 9cb04b1a4d476fd0782431764c7b55e91c6dbcbc6197c3dab3e044f13d058011: cannot reshape array of size 265728 into shape (5):
+    #
+
+
+def run_check_train_data():
+    train_data_folder = os.path.join(ARTIFACTS_FOLDER, 'bev_train_data')
+
+    input_filepaths = sorted(glob.glob(os.path.join(train_data_folder, "*_input.png")))
+    target_filepaths = sorted(glob.glob(os.path.join(train_data_folder, "*_target.png")))
+    map_filepaths = sorted(glob.glob(os.path.join(train_data_folder, "*_map.png")))
+
+    train_dataset = BEVImageDataset(mode='train', input_filepaths = input_filepaths, target_filepaths=target_filepaths,
+                                    map_filepaths=map_filepaths)
+
+    # im, target, sample_token = train_dataset[1]
+    # im = im.numpy()
+    # target = target.numpy()
+    # plt.figure(figsize=(16, 8))
+    # target_as_rgb = np.repeat(target[..., None], 3, 2)
+    # # Transpose the input volume CXY to XYC order, which is what matplotlib requires.
+    # plt.imshow(np.hstack((im.transpose(1, 2, 0)[..., :3], target_as_rgb)))
+    # plt.title(sample_token)
+    # plt.show()
+
+    for n in range(0, len(train_dataset)):
         i = n  # i = np.random.choice(len(dataset))
 
-        image, mask, infor = dataset[i]
+        image, mask, sample_token = train_dataset[i]
+        image = image.numpy()*256
+        mask = mask.numpy()
         overlay = np.vstack([m for m in mask])
 
         # ----
-        print('%05d : %s' % (i, infor.image_id))
-        image_show('image', image, 0.5)
-        image_show_norm('mask', overlay, 0, 1, 0.5)
+        image_show('image', image.transpose(1,2,0)[..., :3], 2)
+        image_show_norm('mask', overlay, min=0, max=1, resize=2)
+        image_show('map', image.transpose(1,2,0)[..., 3:], 2)
+
         cv2.waitKey(0)
 
+    # visualize_lidar_of_sample(dataset, sample_token)
 
 def run_check_test_dataset():
     dataset = SteelDataset(
@@ -1307,9 +965,10 @@ def run_check_augment():
 # main #################################################################
 if __name__ == '__main__':
     print('%s: calling main function ... ' % os.path.basename(__file__))
+    # generate_bev_data()
+    run_check_train_data()
 
-    run_check_train_dataset()
     # run_check_test_dataset()
 
     # run_check_data_loader()
-    #r un_check_augment()
+    # run_check_augment()

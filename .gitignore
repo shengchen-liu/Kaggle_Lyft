@@ -10,6 +10,7 @@ NeuralNet/
 scripts/
 save/
 *.npy
+artifacts/
 
 
 # Byte-compiled / optimized / DLL files
