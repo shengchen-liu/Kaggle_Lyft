@@ -11,7 +11,7 @@ scripts/
 save/
 *.npy
 artifacts/
-
+solution/lyft/pretrained_models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
